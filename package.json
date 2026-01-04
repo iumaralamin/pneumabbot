@@ -1,0 +1,16 @@
+{
+  "name": "telegram-mega-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for managing MEGA storage like a terminal",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.5.0",
+    "form-data": "^4.0.0",
+    "fs": "0.0.1-security",
+    "node-telegram-bot-api": "^0.61.0",
+    "path": "^0.12.7"
+  }
+}
