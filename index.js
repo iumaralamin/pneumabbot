@@ -1,191 +1,275 @@
+
 const TelegramBot = require('node-telegram-bot-api');
+const express = require('express');
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 
-/* ================= ENV ================= */
+// ------------------- ENV -------------------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const SERVER_URL = process.env.SERVER_URL;
+const SERVER_URL = process.env.SERVER_URL; // Your Mega server
+const BOT_URL = process.env.BOT_URL;       // Your Render deployment URL
 
-if (!TELEGRAM_TOKEN || !SERVER_URL) {
-    console.error('❌ TELEGRAM_TOKEN or SERVER_URL missing');
-    process.exit(1);
+if (!TELEGRAM_TOKEN || !SERVER_URL || !BOT_URL) {
+  console.error("❌ Please set TELEGRAM_TOKEN, SERVER_URL, and BOT_URL in .env");
+  process.exit(1);
 }
 
-/* ================= BOT ================= */
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-console.log('🤖 Telegram bot started');
+// ------------------- Bot Setup -------------------
+const bot = new TelegramBot(TELEGRAM_TOKEN, { webHook: true });
+bot.setWebHook(`${BOT_URL}/bot${TELEGRAM_TOKEN}`);
 
-/* ================= USER STATE ================= */
-const userState = new Map();
+// ------------------- Express -------------------
+const app = express();
+app.use(express.json());
 
-function getState(userId) {
-    if (!userState.has(userId)) {
-        userState.set(userId, { cwd: '/', uploadTarget: null });
-    }
-    return userState.get(userId);
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Bot server running on port ${PORT}`));
+
+// ------------------- User State -------------------
+const userStates = new Map();
+function getUserState(userId) {
+  if (!userStates.has(userId)) {
+    userStates.set(userId, { cwd: '/', uploadingFile: null });
+  }
+  return userStates.get(userId);
 }
 
-/* ================= HELP ================= */
-const HELP_TEXT = `
-📂 *MEGA File Bot Commands*
+// ------------------- Help Text -------------------
+const HELP_TEXT = `📂 MEGA File Bot Commands (Full Explanation)
 
-pwd  
-ls  
-cd <folder>  
-cd ..  
+🔹 /start
+  Starts the bot and shows this help message.
 
-upload  
-download <file>  
+🔹 help
+  Shows all commands with explanations.
 
-mv <source> <destination>  
-cp <source> <destination>  
+🔹 pwd
+  Shows the current folder path.
 
-help
+🔹 ls
+  Lists all files and folders in the current directory.
+  If the folder is empty, shows 'Folder is empty'.
+
+🔹 tree
+  Shows the entire file system structure recursively from current folder.
+
+🔹 cd <folder>
+  Move into the specified folder.
+
+🔹 cd ..
+  Go up one directory.
+
+🔹 mkdir <folder>
+  Create a new folder in the current directory.
+
+🔹 upload <filename>
+  Upload a file to the current folder.
+  After running this, send the file through Telegram.
+
+🔹 download <file>
+  Download a file from the current folder.
+
+🔹 mv <source> <destination>
+  Move a file/folder to another location.
+
+🔹 cp <source> <destination>
+  Copy a file/folder to another location.
 `;
 
-/* ================= COMMAND HANDLER ================= */
+// ------------------- Bot Commands -------------------
 bot.on('message', async (msg) => {
-    if (!msg.text) return;
+  const userId = msg.from.id;
+  const text = msg.text?.trim();
+  if (!text) return;
 
-    const userId = msg.chat.id;
-    const text = msg.text.trim();
-    const args = text.split(/\s+/);
-    const cmd = args[0].toLowerCase();
+  const state = getUserState(userId);
+  const args = text.split(/\s+/);
+  const cmd = args[0].toLowerCase();
 
-    const state = getState(userId);
+  try {
+    switch (cmd) {
 
-    try {
-        switch (cmd) {
-            case 'help':
-                return bot.sendMessage(userId, HELP_TEXT, { parse_mode: 'Markdown' });
+      // ------------------- Help / Start -------------------
+      case '/start':
+      case 'help':
+        bot.sendMessage(userId, HELP_TEXT);
+        break;
 
-            case 'pwd':
-                return bot.sendMessage(userId, `📍 ${state.cwd}`);
+      // ------------------- Navigation -------------------
+      case 'pwd':
+        bot.sendMessage(userId, `📍 ${state.cwd}`);
+        break;
 
-            case 'ls': {
-                const res = await axios.get(`${SERVER_URL}/list`, {
-                    params: { folder: state.cwd }
-                });
-
-                if (!res.data.files.length) {
-                    return bot.sendMessage(userId, '📁 Empty folder');
-                }
-
-                const out = res.data.files.map(f =>
-                    f.isFolder ? `📂 ${f.name}` : `📄 ${f.name} (${f.size}b)`
-                ).join('\n');
-
-                return bot.sendMessage(userId, out);
-            }
-
-            case 'cd': {
-                if (!args[1]) {
-                    return bot.sendMessage(userId, '❌ cd <folder>');
-                }
-
-                if (args[1] === '..') {
-                    state.cwd = path.posix.dirname(state.cwd);
-                    if (state.cwd === '.') state.cwd = '/';
-                    return bot.sendMessage(userId, `📂 ${state.cwd}`);
-                }
-
-                const target = path.posix.join(state.cwd, args[1]);
-                await axios.get(`${SERVER_URL}/list`, { params: { folder: target } });
-
-                state.cwd = target;
-                return bot.sendMessage(userId, `📂 ${state.cwd}`);
-            }
-
-            case 'upload':
-                state.uploadTarget = state.cwd;
-                return bot.sendMessage(userId, '📤 Send the file now');
-
-            case 'download': {
-                if (!args[1]) {
-                    return bot.sendMessage(userId, '❌ download <file>');
-                }
-
-                const res = await axios.get(`${SERVER_URL}/list`, {
-                    params: { folder: state.cwd }
-                });
-
-                const file = res.data.files.find(
-                    f => f.name === args[1] && !f.isFolder
-                );
-
-                if (!file) {
-                    return bot.sendMessage(userId, '❌ File not found');
-                }
-
-                return bot.sendDocument(
-                    userId,
-                    `${SERVER_URL}/download/${file.handle}`
-                );
-            }
-
-            case 'mv':
-            case 'cp': {
-                if (args.length < 3) {
-                    return bot.sendMessage(userId, `❌ ${cmd} <src> <dest>`);
-                }
-
-                const endpoint = cmd === 'mv' ? 'move' : 'copy';
-
-                await axios.post(`${SERVER_URL}/${endpoint}`, {
-                    source: args[1],
-                    destination: path.posix.join(state.cwd, args[2])
-                });
-
-                return bot.sendMessage(userId, `✅ ${cmd} successful`);
-            }
-
-            default:
-                return bot.sendMessage(userId, '❓ Unknown command. Type `help`');
+      case 'ls':
+        {
+          const resp = await axios.get(`${SERVER_URL}/list`, { params: { userId, folder: state.cwd } });
+          const files = resp.data.files || [];
+          if (files.length === 0) {
+            bot.sendMessage(userId, '📁 Folder is empty.');
+            break;
+          }
+          let list = '';
+          files.forEach(f => {
+            list += f.isFolder ? `📂 ${f.name}\n` : `📄 ${f.name} (${f.size} bytes)\n`;
+          });
+          bot.sendMessage(userId, list);
         }
-    } catch (err) {
-        return bot.sendMessage(userId, `❌ Error: ${err.message}`);
-    }
-});
+        break;
 
-/* ================= FILE UPLOAD HANDLER ================= */
-bot.on('document', async (msg) => {
-    const userId = msg.chat.id;
-    const state = getState(userId);
+      case 'tree':
+        {
+          const buildTree = async (folder) => {
+            const resp = await axios.get(`${SERVER_URL}/list`, { params: { userId, folder } });
+            const files = resp.data.files || [];
+            let result = '';
+            for (const f of files) {
+              if (f.isFolder) {
+                result += `📂 ${path.posix.join(folder, f.name)}\n`;
+                result += await buildTree(path.posix.join(folder, f.name));
+              } else {
+                result += `📄 ${path.posix.join(folder, f.name)} (${f.size} bytes)\n`;
+              }
+            }
+            return result;
+          };
+          const treeOutput = await buildTree(state.cwd);
+          bot.sendMessage(userId, treeOutput || '📁 Folder is empty.');
+        }
+        break;
 
-    if (!state.uploadTarget) return;
+      case 'cd':
+        {
+          if (!args[1]) return bot.sendMessage(userId, '❌ Usage: cd <folder>');
+          let target = args[1];
+          if (target === '..') {
+            state.cwd = path.posix.dirname(state.cwd);
+            if (state.cwd === '.') state.cwd = '/';
+          } else {
+            const resp = await axios.get(`${SERVER_URL}/list`, { params: { userId, folder: state.cwd } });
+            const folderExists = resp.data.files.some(f => f.isFolder && f.name === target);
+            if (!folderExists) return bot.sendMessage(userId, '❌ Folder not found');
+            state.cwd = path.posix.join(state.cwd, target);
+          }
+          bot.sendMessage(userId, `📂 Changed directory: ${state.cwd}`);
+        }
+        break;
 
-    const fileId = msg.document.file_id;
-    const fileInfo = await bot.getFile(fileId);
+      // ------------------- Make Directory -------------------
+      case 'mkdir':
+        {
+          const folderName = args[1];
+          if (!folderName) return bot.sendMessage(userId, '❌ Usage: mkdir <folder>');
+          try {
+            const resp = await axios.post(`${SERVER_URL}/mkdir`, { userId, folder: state.cwd, name: folderName });
+            if (resp.data.success) bot.sendMessage(userId, `✅ Folder created: ${folderName}`);
+            else bot.sendMessage(userId, `❌ Failed to create folder: ${resp.data.error}`);
+          } catch (err) {
+            bot.sendMessage(userId, `❌ Error: ${err.message}`);
+          }
+        }
+        break;
 
-    const tempDir = path.join(__dirname, 'tmp');
-    fs.mkdirSync(tempDir, { recursive: true });
+      // ------------------- Upload -------------------
+      case 'upload':
+        {
+          const fileName = args[1];
+          if (!fileName) return bot.sendMessage(userId, '❌ Usage: upload <filename>');
+          state.uploadingFile = { name: fileName, folder: state.cwd };
+          bot.sendMessage(userId, '📤 Please send the file now.');
+        }
+        break;
 
-    const localPath = path.join(tempDir, msg.document.file_name);
-    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
+      // ------------------- Download -------------------
+      case 'download':
+        {
+          const fileName = args[1];
+          if (!fileName) return bot.sendMessage(userId, '❌ Usage: download <filename>');
 
-    const response = await axios.get(fileUrl, { responseType: 'stream' });
-    response.data.pipe(fs.createWriteStream(localPath));
+          const resp = await axios.get(`${SERVER_URL}/list`, { params: { userId, folder: state.cwd } });
+          const file = resp.data.files.find(f => f.name === fileName && !f.isFolder);
+          if (!file) return bot.sendMessage(userId, '❌ File not found');
 
-    response.data.on('end', async () => {
-        try {
-            const form = new FormData();
-            form.append('file', fs.createReadStream(localPath));
-            form.append('folder', state.uploadTarget);
-            form.append('filename', msg.document.file_name);
+          bot.sendMessage(userId, `⬇️ Downloading ${fileName}...`);
+          bot.sendDocument(userId, file.handle ? `${SERVER_URL}/download/${file.handle}` : null);
+        }
+        break;
 
-            await axios.post(`${SERVER_URL}/upload-book`, form, {
-                headers: form.getHeaders()
+      // ------------------- Move / Copy -------------------
+      case 'mv':
+      case 'cp':
+        {
+          const [_, src, dest] = args;
+          if (!src || !dest) return bot.sendMessage(userId, `❌ Usage: ${cmd} <source> <dest>`);
+          try {
+            const endpoint = cmd === 'mv' ? 'move' : 'copy';
+            const resp = await axios.post(`${SERVER_URL}/${endpoint}`, {
+              userId,
+              source: src,
+              destination: path.posix.join(state.cwd, dest)
             });
-
-            bot.sendMessage(userId, '✅ Upload complete');
-        } catch (err) {
-            bot.sendMessage(userId, `❌ Upload failed: ${err.message}`);
-        } finally {
-            fs.unlinkSync(localPath);
-            state.uploadTarget = null;
+            if (resp.data.success) bot.sendMessage(userId, `✅ ${cmd} successful: ${resp.data.message}`);
+            else bot.sendMessage(userId, `❌ ${cmd} failed: ${resp.data.error}`);
+          } catch (err) {
+            bot.sendMessage(userId, `❌ ${cmd} error: ${err.message}`);
+          }
         }
-    });
+        break;
+
+      default:
+        bot.sendMessage(userId, '❓ Unknown command. Type `help`');
+    }
+  } catch (err) {
+    bot.sendMessage(userId, `❌ Error: ${err.message}`);
+  }
 });
 
+// ------------------- Handle actual file upload -------------------
+bot.on('document', async (msg) => {
+  const userId = msg.from.id;
+  const state = getUserState(userId);
+  if (!state.uploadingFile) return;
+
+  const fileId = msg.document.file_id;
+  const fileInfo = await bot.getFile(fileId);
+  const filePath = path.join(__dirname, 'temp', msg.document.file_name);
+  fs.mkdirSync(path.join(__dirname, 'temp'), { recursive: true });
+
+  const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${fileInfo.file_path}`;
+  const writer = fs.createWriteStream(filePath);
+  const response = await axios.get(fileUrl, { responseType: 'stream' });
+  response.data.pipe(writer);
+
+  writer.on('finish', async () => {
+    try {
+      const form = new FormData();
+      form.append('file', fs.createReadStream(filePath));
+      form.append('filename', state.uploadingFile.name);
+      form.append('description', '');
+      form.append('userId', userId);
+      form.append('folder', state.uploadingFile.folder);
+
+      const uploadResp = await axios.post(`${SERVER_URL}/upload-book`, form, { headers: form.getHeaders() });
+      if (uploadResp.data.success) {
+        bot.sendMessage(userId, `✅ Upload successful!\nDownload URL: ${uploadResp.data.downloadUrl}`);
+      } else bot.sendMessage(userId, `❌ Upload failed: ${uploadResp.data.error}`);
+
+      fs.unlinkSync(filePath);
+      state.uploadingFile = null;
+    } catch (err) {
+      bot.sendMessage(userId, `❌ Upload error: ${err.message}`);
+      state.uploadingFile = null;
+    }
+  });
+
+  writer.on('error', (err) => {
+    bot.sendMessage(userId, `❌ Error downloading file: ${err.message}`);
+    state.uploadingFile = null;
+  });
+});
